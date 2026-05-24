@@ -1,10 +1,11 @@
 ---
 name: cross-review
 description: >
-  多模型交叉审查 v1.1：R0 Perplexity 联网调研 → 4-reviewer 议会 (Gemini Promoter + GPT Critic + Grok Troublemaker + Claude Code Pragmatist) →
+  多模型交叉审查 v2：R0 Perplexity 联网调研 → 议会 4-7 人辩论 (默认 4 人, --multi-role 可扩到 7 人) →
   Claude Opus 4.7 跨厂商 Judge 双盲综合。输出双层 schema (summary + audit)。
   Use when: 用户要求多模型审查、跨模型讨论、设计决策校验、"拉其他模型一起看"、架构选型。
-  关键升级：Pragmatist 由主调用方 (Claude Code with memory) 直接提供视角，避免 fresh model 凭空推断。
+  v2 关键升级: 每个角色 (除 Pragmatist) 可由 1-2 模型并行扮演, 发现更多互补盲区。
+  Pragmatist 由主调用方 (Claude Code with memory) 直接提供视角。
   不适合：纯编码实现、简单事实查询、紧急 hotfix。
 ---
 
@@ -66,12 +67,33 @@ python ~/.claude/skills/cross-review/scripts/cross_review.py \
 |------|------|------|
 | `--profile` | `premium` | `cheap` / `balanced` / `premium` |
 | `--rounds` | `2` | 辩论轮次（推荐 2，超过 3 边际收益极低） |
+| `--multi-role` | `None` (1:1) | v2 新增. 启用多模型扩展. 选项: `critic` / `troublemaker` / `promoter` / `all` / 逗号分隔. Pragmatist 不可扩展 (memory 唯一) |
 | `--with-judge` / `--no-judge` | `--with-judge` | 是否跑独立 judge 综合 |
-| `--no-research` | off | 跳过 R0 Perplexity 调研 (省成本但失去最新信息) |
+| `--no-research` | off | 跳过 R0 Perplexity 调研 |
 | `--no-early-stop` | off | 关闭结构化早停 |
 | `--max-cost` | `5.00` | 美元成本上限 |
 | `--output` | temp dir | markdown 报告路径 |
 | `--json-output` | 不输出 | judge JSON 路径 |
+
+### v2 Multi-Role 模式 (新增)
+
+每个角色 (除 Pragmatist) 可由 1-2 模型并行扮演, 发现更多互补盲区:
+
+| 命令 | 议会规模 | 适用场景 |
+|------|---------|---------|
+| (default) | 4 人 (1:1) | 通用决策 |
+| `--multi-role critic` | 5 人 (Critic ×2) | 边界情况、failure mode 多视角 |
+| `--multi-role troublemaker` | 5 人 (Troublemaker ×2) | 反共识多视角, 找更多盲区 |
+| `--multi-role promoter` | 5 人 (Promoter ×2) | 探索多种可行方案 |
+| `--multi-role critic,troublemaker` | 6 人 | 找问题双重保险 |
+| `--multi-role all` | 7 人 | 全角色多视角, 大型决策 |
+
+实测成本 (balanced profile):
+- default 1:1: $0.40-0.80
+- multi-role critic: $0.50-1.00
+- multi-role all: $0.70-1.30
+
+Pragmatist 不可扩展 — 它由主调用方 memory 提供, 不能复制。
 
 ## Profile 对照
 

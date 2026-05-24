@@ -1,12 +1,12 @@
-# Cross-Review v1.1
+# Cross-Review v2
 
-> Claude Code skill: **R0 Perplexity 调研 + 4-reviewer 议会 + Claude Code 自带 Pragmatist + Opus 4.7 Judge**
-> Cross-vendor multi-model review with live web research, memory-aware pragmatist injection, and strongest-model independent judge.
+> Claude Code skill: **R0 Perplexity 调研 + 议会 4-7 人辩论 (multi-role 可扩展) + Claude Code 自带 Pragmatist + Opus 4.7 Judge**
+> Cross-vendor multi-role council debate with live web research, memory-aware pragmatist, and strongest-model independent judge.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![OpenRouter](https://img.shields.io/badge/API-OpenRouter-purple.svg)](https://openrouter.ai/)
-[![Version](https://img.shields.io/badge/version-1.1.0-green.svg)]()
+[![Version](https://img.shields.io/badge/version-2.0.0-green.svg)]()
 
 当你面对一个**架构选择**、**方案设计**或**关键决策**时，cross-review 流程：
 
@@ -200,7 +200,45 @@ python ~/.claude/skills/cross-review/scripts/cross_review.py \
 
 ---
 
-## Profile 对照 (v1.1)
+## Multi-Role 模式 (v2 新增)
+
+每个角色 (除 Pragmatist) 可由 1-2 模型并行扮演，发现更多互补盲区。
+
+```bash
+# 默认 1:1 (4 议会, 兼容 v1.1)
+python cross_review.py review.json --profile balanced
+
+# Critic 角色用 2 模型 (5 议会, 边界情况多视角)
+python cross_review.py review.json --profile balanced --multi-role critic
+
+# 所有角色多模型 (7 议会, 大型决策)
+python cross_review.py review.json --profile balanced --multi-role all
+```
+
+| 命令 | 议会规模 | 适用场景 |
+|------|---------|---------|
+| (default) | 4 (1:1) | 通用决策 |
+| `--multi-role critic` | 5 (Critic ×2) | 边界情况、failure mode 多视角 |
+| `--multi-role troublemaker` | 5 (Troublemaker ×2) | 反共识多视角 |
+| `--multi-role promoter` | 5 (Promoter ×2) | 多种可行方案探索 |
+| `--multi-role critic,troublemaker` | 6 | 找问题双重保险 |
+| `--multi-role all` | 7 | 全角色多视角 (Pragmatist 仍 1 个) |
+
+**为什么 Pragmatist 不能扩展**: 它由主调用方 (Claude Code with memory) 提供, 项目 memory 唯一不可复制。
+
+**多角色组合 (balanced profile)**:
+
+| 角色 | 1:1 default | 1:2 multi-role 第 2 模型 |
+|------|-------------|--------------------------|
+| Promoter | Gemini 3.1 Pro | + Claude Sonnet 4.6 (建设方案不同切入点) |
+| Critic | GPT-5.4 | + DeepSeek V4 Pro (形式逻辑 + 数学/代码) |
+| Troublemaker | Grok 4.20 | + DeepSeek V4 Pro (反共识互补) |
+| Pragmatist | Claude Code (主调用方) | (无法扩展) |
+| Judge | Claude Sonnet 4.6 | (judge 始终 1 个) |
+
+---
+
+## Profile 对照 (v2)
 
 | Profile | R0 Research | Promoter | Critic (+PUA) | Troublemaker (+PUA) | Pragmatist | Judge | 成本/次 |
 |---------|-------------|----------|---------------|---------------------|------------|-------|---------|

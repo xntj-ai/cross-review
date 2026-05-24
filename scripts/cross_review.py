@@ -57,40 +57,59 @@ _proxy = os.environ.get("OPENROUTER_PROXY", "http://127.0.0.1:10808")
 _proxy_handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})
 urllib.request.install_opener(urllib.request.build_opener(_proxy_handler))
 
-# --- Model profiles (v1.1: R0 调研 + 3 reviewer + Pragmatist (外部 or fallback) + Opus Judge) ---
+# --- Model profiles (v2: multi-role 议会 — 每角色可由 1-2 模型并行) ---
 # Verified 2026-05-24 against OpenRouter API.
+# reviewers: dict[role, list of models] — default 1:1, multi_role_extensions 添加第 2 模型
 PROFILES = {
     "cheap": {
-        "research": {"id": "perplexity/sonar",     "name": "Perplexity Sonar (Research)",     "temp": 0.2},
-        "reviewers": [
-            {"id": "google/gemini-3-flash-preview", "name": "Gemini 3 Flash",    "role": "promoter",     "temp": 0.3, "use_pua": False},
-            {"id": "openai/gpt-5.4-mini",           "name": "GPT-5.4 Mini",      "role": "critic",       "temp": 0.3, "use_pua": True},
-            {"id": "x-ai/grok-4.20",                "name": "Grok 4.20",         "role": "troublemaker", "temp": 0.7, "use_pua": True},
-        ],
+        "research": {"id": "perplexity/sonar", "name": "Perplexity Sonar (Research)", "temp": 0.2},
+        "reviewers": {
+            "promoter":     [{"id": "google/gemini-3-flash-preview", "name": "Gemini 3 Flash",    "role": "promoter",     "temp": 0.3, "use_pua": False}],
+            "critic":       [{"id": "openai/gpt-5.4-mini",           "name": "GPT-5.4 Mini",      "role": "critic",       "temp": 0.3, "use_pua": True}],
+            "troublemaker": [{"id": "x-ai/grok-4.20",                "name": "Grok 4.20",         "role": "troublemaker", "temp": 0.7, "use_pua": True}],
+        },
+        "multi_role_extensions": {
+            "promoter":     [{"id": "anthropic/claude-haiku-4.5",    "name": "Claude Haiku 4.5",   "role": "promoter",     "temp": 0.3, "use_pua": False}],
+            "critic":       [{"id": "deepseek/deepseek-v4-flash",    "name": "DeepSeek V4 Flash",  "role": "critic",       "temp": 0.3, "use_pua": True}],
+            "troublemaker": [{"id": "deepseek/deepseek-v4-flash",    "name": "DeepSeek V4 Flash (TM)", "role": "troublemaker", "temp": 0.7, "use_pua": True}],
+        },
         "pragmatist_fallback": {"id": "anthropic/claude-haiku-4.5", "name": "Claude Haiku 4.5 (Pragmatist fallback)", "role": "pragmatist", "temp": 0.4, "use_pua": False},
         "judge": {"id": "anthropic/claude-haiku-4.5", "name": "Claude Haiku 4.5 (Judge)", "temp": 0.1},
     },
     "balanced": {
         "research": {"id": "perplexity/sonar-pro", "name": "Perplexity Sonar Pro (Research)", "temp": 0.2},
-        "reviewers": [
-            {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",     "role": "promoter",     "temp": 0.3, "use_pua": False},
-            {"id": "openai/gpt-5.4",                "name": "GPT-5.4",            "role": "critic",       "temp": 0.3, "use_pua": True},
-            {"id": "x-ai/grok-4.20",                "name": "Grok 4.20",          "role": "troublemaker", "temp": 0.7, "use_pua": True},
-        ],
+        "reviewers": {
+            "promoter":     [{"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",     "role": "promoter",     "temp": 0.3, "use_pua": False}],
+            "critic":       [{"id": "openai/gpt-5.4",                "name": "GPT-5.4",            "role": "critic",       "temp": 0.3, "use_pua": True}],
+            "troublemaker": [{"id": "x-ai/grok-4.20",                "name": "Grok 4.20",          "role": "troublemaker", "temp": 0.7, "use_pua": True}],
+        },
+        "multi_role_extensions": {
+            "promoter":     [{"id": "anthropic/claude-sonnet-4.6",   "name": "Claude Sonnet 4.6 (Promoter)", "role": "promoter", "temp": 0.3, "use_pua": False}],
+            "critic":       [{"id": "deepseek/deepseek-v4-pro",      "name": "DeepSeek V4 Pro (Critic)",     "role": "critic",   "temp": 0.3, "use_pua": True}],
+            "troublemaker": [{"id": "deepseek/deepseek-v4-pro",      "name": "DeepSeek V4 Pro (TM)",         "role": "troublemaker", "temp": 0.7, "use_pua": True}],
+        },
         "pragmatist_fallback": {"id": "anthropic/claude-sonnet-4.6", "name": "Claude Sonnet 4.6 (Pragmatist fallback)", "role": "pragmatist", "temp": 0.4, "use_pua": False},
         "judge": {"id": "anthropic/claude-sonnet-4.6", "name": "Claude Sonnet 4.6 (Judge)", "temp": 0.1},
     },
     "premium": {
         "research": {"id": "perplexity/sonar-pro", "name": "Perplexity Sonar Pro (Research)", "temp": 0.2},
-        "reviewers": [
-            {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",         "role": "promoter",     "temp": 0.3, "use_pua": False},
-            {"id": "openai/gpt-5.5",                "name": "GPT-5.5",                "role": "critic",       "temp": 0.3, "use_pua": True},
-            {"id": "x-ai/grok-4.20-multi-agent",    "name": "Grok 4.20 Multi-Agent",  "role": "troublemaker", "temp": 0.7, "use_pua": True},
-        ],
+        "reviewers": {
+            "promoter":     [{"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",         "role": "promoter",     "temp": 0.3, "use_pua": False}],
+            "critic":       [{"id": "openai/gpt-5.5",                "name": "GPT-5.5",                "role": "critic",       "temp": 0.3, "use_pua": True}],
+            "troublemaker": [{"id": "x-ai/grok-4.20-multi-agent",    "name": "Grok 4.20 Multi-Agent",  "role": "troublemaker", "temp": 0.7, "use_pua": True}],
+        },
+        "multi_role_extensions": {
+            "promoter":     [{"id": "anthropic/claude-sonnet-4.6",   "name": "Claude Sonnet 4.6 (Promoter)", "role": "promoter", "temp": 0.3, "use_pua": False}],
+            "critic":       [{"id": "deepseek/deepseek-v4-pro",      "name": "DeepSeek V4 Pro (Critic)",     "role": "critic",   "temp": 0.3, "use_pua": True}],
+            "troublemaker": [{"id": "deepseek/deepseek-v4-pro",      "name": "DeepSeek V4 Pro (TM)",         "role": "troublemaker", "temp": 0.7, "use_pua": True}],
+        },
         "pragmatist_fallback": {"id": "anthropic/claude-sonnet-4.6", "name": "Claude Sonnet 4.6 (Pragmatist fallback)", "role": "pragmatist", "temp": 0.4, "use_pua": False},
         "judge": {"id": "anthropic/claude-opus-4.7", "name": "Claude Opus 4.7 (Judge)", "temp": 0.1},
     },
 }
+
+# Valid roles for --multi-role expansion (Pragmatist 不可扩展, memory 唯一)
+EXPANDABLE_ROLES = ["promoter", "critic", "troublemaker"]
 
 DEFAULT_PROFILE = "premium"
 DEFAULT_MAX_COST = 5.00  # R0 + 4 reviewer × 2 rounds + judge
@@ -329,11 +348,13 @@ def call_openrouter(api_key, model_id, messages, temperature=0.3, timeout=300, m
 
 
 def run_round_parallel(api_key, reviewers, messages_per_model):
+    """v2: dict key 用 instance_id (因同一 model_id 可能扮演不同角色, 如 DeepSeek 同时做 Critic 和 Troublemaker)"""
     results = {}
-    with ThreadPoolExecutor(max_workers=len(reviewers)) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, len(reviewers))) as executor:
         futures = {}
         for r in reviewers:
-            msgs = messages_per_model[r["id"]]
+            iid = r["instance_id"]
+            msgs = messages_per_model[iid]
             future = executor.submit(
                 call_openrouter,
                 api_key, r["id"], msgs, r.get("temp", 0.3),
@@ -343,7 +364,7 @@ def run_round_parallel(api_key, reviewers, messages_per_model):
         for future in as_completed(futures):
             r = futures[future]
             res = future.result()
-            results[r["id"]] = {**res, "name": r["name"], "role": r.get("role", "")}
+            results[r["instance_id"]] = {**res, "name": r["name"], "role": r.get("role", "")}
     return results
 
 
@@ -600,6 +621,9 @@ def main():
     parser.add_argument("prompt_file", help="JSON with {context, question}")
     parser.add_argument("--profile", default=DEFAULT_PROFILE, choices=list(PROFILES.keys()),
                         help=f"Model combination profile (default: {DEFAULT_PROFILE})")
+    parser.add_argument("--multi-role", default=None,
+                        help="启用多模型扩展. 选项: critic, troublemaker, promoter, all. "
+                             "逗号分隔多个角色, 如 'critic,troublemaker'. Pragmatist 不可扩展 (memory 唯一).")
     parser.add_argument("--rounds", type=int, default=2,
                         help="Number of debate rounds (default: 2)")
     parser.add_argument("--with-judge", action="store_true", default=True,
@@ -627,7 +651,35 @@ def main():
     research_model_cfg = profile.get("research")
     judge_model_cfg = profile["judge"]
 
-    # v1.1: Pragmatist 优先用主调用方 (Claude Code with memory) 提供的 view, fallback 到 Sonnet 4.6
+    # 解析 --multi-role 参数, 决定哪些角色启用第 2 模型
+    multi_role_set = set()
+    if args.multi_role:
+        raw = args.multi_role.strip().lower()
+        if raw == "all":
+            multi_role_set = set(EXPANDABLE_ROLES)
+        else:
+            for r in raw.split(","):
+                r = r.strip()
+                if r in EXPANDABLE_ROLES:
+                    multi_role_set.add(r)
+                elif r:
+                    print(f"WARNING: --multi-role '{r}' 不支持 (Pragmatist 不可扩展, 或角色名错). 跳过.", file=sys.stderr)
+
+    # v2: 动态构建 reviewers list
+    # PROFILES["reviewers"] 是 dict[role, list of models]
+    # multi_role_set 中的角色添加 multi_role_extensions[role] 的模型
+    reviewers = []
+    role_order = ["promoter", "critic", "troublemaker"]
+    for role in role_order:
+        base_models = profile["reviewers"].get(role, [])
+        for m in base_models:
+            reviewers.append({**m, "instance_id": f"{m['id']}#{role}#0"})
+        if role in multi_role_set:
+            ext_models = profile.get("multi_role_extensions", {}).get(role, [])
+            for i, m in enumerate(ext_models):
+                reviewers.append({**m, "instance_id": f"{m['id']}#{role}#{i+1}"})
+
+    # Pragmatist: 优先用主调用方 (Claude Code with memory) 提供的 view, fallback 到 Sonnet 4.6
     pragmatist_view = prompt_data.get("pragmatist_view", "").strip()
     pragmatist_cfg = dict(profile["pragmatist_fallback"])
     if pragmatist_view:
@@ -637,22 +689,24 @@ def main():
             "name": "Claude Code (with memory)",
             "external_r1_content": pragmatist_view,
         }
-
-    # 议会 = 3 reviewer (Promoter/Critic/Troublemaker) + Pragmatist (外部 view 或 fallback)
-    reviewers = list(profile["reviewers"]) + [pragmatist_cfg]
+    pragmatist_cfg["instance_id"] = f"{pragmatist_cfg['id']}#pragmatist#0"
+    reviewers.append(pragmatist_cfg)
 
     api_key = get_api_key()
     total_cost = 0.0
 
-    # Anonymization: Council Member A/B/C/D 按 reviewer 顺序固定
-    anon_letters = ["A", "B", "C", "D"]
-    anon_map = {r["id"]: anon_letters[i] for i, r in enumerate(reviewers)}
+    # Anonymization: Council Member 字母 按 reviewer 顺序固定 (v2 扩到 A-G 支持议会 4-7 人)
+    anon_letters = ["A", "B", "C", "D", "E", "F", "G", "H"]
+    if len(reviewers) > len(anon_letters):
+        print(f"ERROR: 议会规模 {len(reviewers)} 超过支持上限 {len(anon_letters)}", file=sys.stderr)
+        sys.exit(1)
+    anon_map = {r["instance_id"]: anon_letters[i] for i, r in enumerate(reviewers)}
 
     output_lines = [
         "# Cross-Review v1.1 报告",
         f"\n**Profile**: {args.profile}",
         f"**Reviewers (匿名映射)**: " + ", ".join(
-            f"{r['name']} ({r['role']}) = Member {anon_map[r['id']]}" for r in reviewers
+            f"{r['name']} ({r['role']}) = Member {anon_map[r['instance_id']]}" for r in reviewers
         ),
         f"**Pragmatist 来源**: " + ("外部 view (主调用方 Claude Code with memory)" if pragmatist_view else "fallback API"),
         f"**Research**: {research_model_cfg['name'] if research_model_cfg else '(skipped)'}",
@@ -682,7 +736,7 @@ def main():
     user_content = build_user_prompt(context, question, research_text)
 
     histories = {
-        r["id"]: [
+        r["instance_id"]: [
             {"role": "system", "content": role_prompt(r["role"], r.get("use_pua", False))},
             {"role": "user", "content": user_content},
         ]
@@ -708,7 +762,7 @@ def main():
                 content = r["external_r1_content"]
                 if round_num > 1:
                     content = content + "\n\n_[Pragmatist 立场在本轮保持不变 — 由主调用方提供, 不参与轮次演化]_"
-                preset_results[r["id"]] = {
+                preset_results[r["instance_id"]] = {
                     "ok": True,
                     "content": content,
                     "cost": 0.0,
@@ -723,7 +777,7 @@ def main():
 
         round_responses = {}
         for r in reviewers:
-            mid = r["id"]
+            mid = r["instance_id"]
             res = results[mid]
             content = res.get("content") or ""
             # Treat ok=True but empty content as soft error (OpenRouter 偶发)
@@ -736,7 +790,7 @@ def main():
                 # Fallback: 如果未在末尾附 JSON, 发轻量请求让同模型补提取
                 if not summary:
                     print(f"  {res['name']}: summary missing, calling fallback extractor...", file=sys.stderr)
-                    summary, fb_cost = summary_fallback_extract(api_key, mid, content, r.get("role", ""))
+                    summary, fb_cost = summary_fallback_extract(api_key, r["id"], content, r.get("role", ""))
                     total_cost += fb_cost
                     if summary:
                         fallback_used = True
@@ -801,13 +855,13 @@ def main():
                 # External Pragmatist 不参与 R2+ history 构造 (R2 复用 R1 content 不调 API)
                 if r.get("external_r1_content"):
                     continue
-                mid = r["id"]
+                mid = r["instance_id"]
                 own = round_responses[mid]["content"]
                 histories[mid].append({"role": "assistant", "content": own})
 
                 other_summaries = {}
                 for other_r in reviewers:
-                    omid = other_r["id"]
+                    omid = other_r["instance_id"]
                     if omid == mid:
                         continue
                     other_summaries[anon_map[omid]] = round_responses[omid].get("summary")
@@ -827,7 +881,7 @@ def main():
         transcript_parts = []
         for round_num, resps in all_round_responses:
             for r in reviewers:
-                mid = r["id"]
+                mid = r["instance_id"]
                 if mid not in resps:
                     continue
                 resp = resps[mid]
