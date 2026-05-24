@@ -32,6 +32,7 @@ import urllib.request
 # --- Config ---
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 MAX_TOKENS = 4000
+JUDGE_MAX_TOKENS = 8000  # Judge schema (consensus/majority/individual/divergences/ledger/warnings/recommendation) 输出较长
 
 # Strip inherited proxies, install local proxy for OpenRouter (CN access fallback)
 for _k in list(os.environ.keys()):
@@ -119,11 +120,27 @@ def judge_prompt() -> str:
     return """你是独立 Judge，正在综合三个模型 (Promoter/Critic/Troublemaker) 的辩论输出。
 你的任务不是再次审查方案，而是分类整理三方观点并给出结构化结论。
 
-严格输出 JSON 格式，schema:
+严格输出 JSON 格式，schema (对齐 Mozilla.ai Star Chamber 业界共识命名):
 
 {
-  "consensus": [
-    {"point": "三方一致的观点（一句话）", "details": "支持细节、引用谁说过"}
+  "consensus_issues": [
+    {"point": "三方 (3/3) 一致标记的观点（一句话）", "details": "支持细节、引用谁说过"}
+  ],
+  "majority_issues": [
+    {
+      "point": "多数 (2/3) 标记的观点（一句话）",
+      "supporters": ["promoter", "critic"],
+      "dissenter": "troublemaker (或 null 如果未明确反对)",
+      "details": "为什么 2/3 同意、dissenter 立场"
+    }
+  ],
+  "individual_observations": [
+    {
+      "source": "promoter|critic|troublemaker",
+      "point": "单方 (1/3) 独有观点（一句话）",
+      "merit": "high|medium|low",
+      "merit_reason": "评级理由 (high = 关键盲区, medium = 有价值, low = 噪声或附和)"
+    }
   ],
   "divergences": [
     {
@@ -134,16 +151,17 @@ def judge_prompt() -> str:
       "judge_recommendation": "你认为哪方论据最强且为什么"
     }
   ],
-  "unique_points": [
+  "ledger": [
     {
-      "source": "promoter|critic|troublemaker",
-      "point": "独有观点（一句话）",
-      "merit": "high|medium|low",
-      "merit_reason": "评级理由"
+      "claim": "具体观点（一句话）",
+      "raised_by": "promoter|critic|troublemaker",
+      "raised_at_round": 1,
+      "stance_evolution": "stable | revised in R2: <修正了什么> | abandoned in R2 | sycophantic shift",
+      "judge_note": "你的归因评价 (可选)"
     }
   ],
   "warnings": [
-    "可能的 sycophancy / 重复内容 / 偏离原题（如有）"
+    "可能的 sycophancy / 偏离原题 / drift / unanimous-bias (全员一致反而可疑) 等"
   ],
   "final_recommendation": "综合三方后的最终建议 (2-4 句，直接告诉用户该怎么做)"
 }
@@ -152,7 +170,13 @@ def judge_prompt() -> str:
 - 只输出 JSON，不加任何外层文字
 - 不要 markdown 代码块包裹
 - 中文内容
-- 如果某 unique_point 仅是噪声或附和性补充，merit 标 "low"
+- 分类规则: 3/3 提到 → consensus_issues; 2/3 → majority_issues; 1/3 → individual_observations
+- ledger 控制在 6-10 条最关键 claims，每条 claim 一句话(≤40字)，stance_evolution 一句话(≤40字)
+- consensus_issues / majority_issues / individual_observations 各项 details 控制在 60 字以内
+- final_recommendation 严格 2-4 句
+- 整体 JSON 输出预算 ≤ 5500 字 (避免截断)
+- 如果某 individual_observation 仅是噪声或附和性补充，merit 标 "low"
+- 警惕"全员一致"反而可疑 (correlated-bias warning): 三方都用相同措辞 + 无 dissent → 在 warnings 里标记
 """
 
 
@@ -189,11 +213,11 @@ def get_api_key() -> str:
     sys.exit(1)
 
 
-def call_openrouter(api_key, model_id, messages, temperature=0.3, timeout=240):
+def call_openrouter(api_key, model_id, messages, temperature=0.3, timeout=240, max_tokens=None):
     payload = json.dumps({
         "model": model_id,
         "messages": messages,
-        "max_tokens": MAX_TOKENS,
+        "max_tokens": max_tokens or MAX_TOKENS,
         "temperature": temperature,
     }).encode("utf-8")
 
@@ -296,10 +320,15 @@ def build_user_prompt(context: str, question: str) -> str:
 """
 
 
-def build_round2_prompt(round_num, other_models_responses, role):
+def build_round2_prompt(round_num, other_models_responses, role, anon_map):
+    """
+    anon_map: {model_id: "Council Member X"} 用于在 R2 隐藏其他模型的品牌身份，
+    防止"Gemini 偏向 Gemini 风格 / GPT 偏向 GPT 风格"的同源偏见 (LLM Council pattern).
+    """
     others = []
-    for _, resp in other_models_responses.items():
-        others.append(f"### {resp['name']} ({resp['role']}) Round {round_num} 观点\n\n{resp['content']}")
+    for omid, resp in other_models_responses.items():
+        anon_name = anon_map.get(omid, "Council Member ?")
+        others.append(f"### {anon_name} ({resp['role']}) Round {round_num} 观点\n\n{resp['content']}")
     peer = "\n\n---\n\n".join(others)
 
     if role == "troublemaker":
@@ -311,7 +340,14 @@ def build_round2_prompt(round_num, other_models_responses, role):
     else:
         role_clause = ""
 
-    return f"""以下是其他模型在 Round {round_num} 的审查意见:
+    # 早期 agree 反向施压 (adversarial-spec pattern): 如果你想纯附和，禁止
+    anti_rubber_stamp = (
+        "\n\n**反 rubber-stamp 约束**: 如果你倾向于完全同意对方所有观点 (rubber-stamp), "
+        "请在回答中明确: (a) 你阅读了对方的哪些具体段落 (b) 你的同意基于什么推理 "
+        "(c) 你是否真的没有任何残留 concern (注意: '没有'本身需要解释为什么没有)。"
+    )
+
+    return f"""以下是 Council 其他成员在 Round {round_num} 的审查意见 (模型身份已匿名化以减少同源偏见):
 
 {peer}
 
@@ -322,7 +358,7 @@ def build_round2_prompt(round_num, other_models_responses, role):
 2. 你反对对方哪些观点？给出理由
 3. 对方提到了什么是你 Round 1 未提及的？这些盲区你怎么看？
 4. 你 Round 1 的立场需要修正吗？如果是，明确说明修正了什么、为什么
-{role_clause}
+{role_clause}{anti_rubber_stamp}
 """
 
 
@@ -376,10 +412,16 @@ def main():
     api_key = get_api_key()
     total_cost = 0.0
 
+    # Anonymization map for R2 (LLM Council pattern): hide brand identity to reduce same-vendor bias
+    anon_letters = ["A", "B", "C", "D", "E"]
+    anon_map = {m["id"]: f"Council Member {anon_letters[i]}" for i, m in enumerate(models)}
+
     output_lines = [
-        "# Cross-Review v2 报告",
+        "# Cross-Review v3 报告",
         f"\n**Profile**: {'custom' if args.models else args.profile}",
-        f"**模型**: " + ", ".join(f"{m['name']} ({m['role']})" for m in models),
+        f"**模型 (R2 匿名映射)**: " + ", ".join(
+            f"{m['name']} ({m['role']}) = {anon_map[m['id']]}" for m in models
+        ),
         f"**配置**: rounds={args.rounds}, judge={'on' if args.with_judge else 'off'}, "
         f"early_stop={'off' if args.no_early_stop else 'on'}, max_cost=${args.max_cost:.2f}",
         f"**时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
@@ -458,7 +500,7 @@ def main():
                 others = {omid: r for omid, r in round_responses.items() if omid != mid}
                 histories[mid].append({
                     "role": "user",
-                    "content": build_round2_prompt(round_num, others, model["role"]),
+                    "content": build_round2_prompt(round_num, others, model["role"], anon_map),
                 })
 
     # Judge round
@@ -483,7 +525,8 @@ def main():
 
         judge_result = call_openrouter(
             api_key, JUDGE_MODEL["id"], judge_messages,
-            temperature=JUDGE_MODEL.get("temp", 0.1), timeout=240,
+            temperature=JUDGE_MODEL.get("temp", 0.1), timeout=300,
+            max_tokens=JUDGE_MAX_TOKENS,
         )
 
         if judge_result["ok"]:

@@ -200,6 +200,44 @@ python ~/.claude/skills/cross-review/scripts/cross_review.py \
 
 ---
 
+## Model Choice Rationale
+
+为什么 default 不选最新/最便宜模型？短答：cross-review 是 **reasoning-heavy 辩论场景**，模型选择基于 benchmark 实证而非"更新就更强"。
+
+### Why Gemini 3.1 Pro (not 3.5 Flash)
+
+Gemini 3.5 Flash (发布 2026-05-19) 比 3.1 Pro 新 3 个月，但 **reasoning 任务上显著弱于 Pro**:
+
+| Benchmark | 3.1 Pro | 3.5 Flash | Pro 优势 |
+|-----------|---------|-----------|----------|
+| ARC-AGI-2 (抽象推理) | **77.1%** | 72.1% | +5.0 |
+| Humanity's Last Exam | **44.4%** | 40.2% | +4.2 |
+| Reasoning aggregate (BenchLM) | **77.1** | 74.7 | +2.4 |
+| SWE-Bench Pro (编码) | 54.2 | **55.1** | Flash +0.9 |
+| MCP Atlas (agentic) | 78.2 | **83.6** | Flash +5.4 |
+
+Google 官方 model card 把 3.5 Flash 定位为 "agentic workflows, coding, multi-week enterprise processes" — **从未声称 reasoning 超过 3.1 Pro**。Flash 的 posttraining **牺牲了纯推理深度换取 tool-use 广度**。Promoter 角色需要"结构化辩护 + 抵抗 Critic 反驳"，100% 命中 Pro 强项。
+
+**唯一换 Flash 的场景**：cross-review 改为"调工具验证方案可行性"的 agentic 模式。当前是纯文本辩论。
+
+### Why GPT-5.5 (premium) / GPT-5.4 (balanced) for Critic
+
+GPT 系列在严格逻辑推理 + 边界条件识别上风格最强。Critic 角色要求"用严格推理识别方案问题、关注 failure mode"，命中 GPT 强项。GPT-5.5 是当前 GA 最新但贵 2x，premium 档值得投入；balanced 档 GPT-5.4 性价比甜点。GPT-5.3 跳号（仅有 5.3-chat/5.3-codex 变体，无主线 5.3）。
+
+### Why Grok 4.20 (Multi-Agent) for Troublemaker
+
+xAI 风格最反共识，其 RLHF 训练不强调"礼貌附和"。Grok 4.20 Multi-Agent 是 OpenRouter 上最贵但反附和力度最大的 Grok 变体（premium 默认），单体 Grok 4.20 在 balanced/cheap 档已足够。
+
+OpenRouter 上**没有** `grok-4`、`grok-4-heavy` 命名，4.20 / 4.3 是当前实际可用 ID。
+
+### Why Independent Gemini Judge (not Claude)
+
+[Self-Preference Bias (arxiv 2410.21819)](https://arxiv.org/abs/2410.21819) 证明 LLM 给自家风格输出系统性偏高分。Claude 作为主调用方已经是 orchestrator，再当 judge 等于自评。Gemini 作为外部独立 judge 消除该偏见。
+
+如果想用 Claude Opus 当 judge（极端情况）：脚本提供 `JUDGE_MODEL` 顶部 const 可改。
+
+---
+
 ## 输出示例
 
 `--with-judge` 时，judge JSON 输出：
@@ -271,19 +309,30 @@ python ~/.claude/skills/cross-review/scripts/cross_review.py \
 
 ---
 
-## v1 → v2 变化
+## v1 → v2 → v3 变化
 
-| 维度 | v1 (2026-02) | v2 (2026-05) |
-|------|--------------|--------------|
-| 模型数 | 2 | 3 |
-| 角色分工 | 同质（资深架构师 ×2） | promoter / critic / troublemaker |
-| temperature | 全模型 0.3 | troublemaker 0.7 |
-| 综合者 | Claude 主模型（自评偏见） | Gemini 独立 judge（可选） |
-| 输出 | markdown only | markdown + 结构化 JSON |
-| 早停 | 无 | R1 共识检测 |
-| 反附和 | 无 | system prompt 强制 + 输出检测 |
-| 成本守卫 | 无 | `--max-cost` |
-| 默认成本 | $0.10-0.20 | $1.50-2.00 (premium) / $0.50 (balanced) |
+| 维度 | v1 (2026-02) | v2 (2026-05-24) | v3 (2026-05-24 PM) |
+|------|--------------|-----------------|---------------------|
+| 模型数 | 2 | 3 | 3 |
+| 角色分工 | 同质（资深架构师 ×2） | promoter / critic / troublemaker | 同 v2 |
+| temperature | 全模型 0.3 | troublemaker 0.7 | 同 v2 |
+| 综合者 | Claude 主模型（自评偏见） | 独立 Gemini judge | 同 v2 |
+| 输出 schema | markdown only | consensus/divergences/unique_points | **consensus_issues/majority_issues/individual_observations/ledger** (对齐 Star Chamber) |
+| 早停 | 无 | R1 关键词启发式 | 同 v2 (DOWN 算法为 v4 候选) |
+| 反附和 | 无 | system prompt 强制 | + **R2 模型身份匿名化** (Council Member A/B/C) + **rubber-stamp 反向施压** |
+| Accountability | 无 | 无 | **ledger 字段** 记录 claim 归因 + stance evolution |
+| Schema 命名 | 自创 | 自创 | **对齐 Mozilla.ai Star Chamber 业界共识** |
+| 成本守卫 | 无 | `--max-cost` | 同 v2 |
+| 默认成本 | $0.10-0.20 | $1.50-2.00 (premium) | 同 v2 |
+
+### v3 设计灵感来源（GitHub 竞品调研）
+
+| v3 改动 | 借鉴 |
+|---------|------|
+| R2 模型身份匿名化 | [karpathy/llm-council](https://github.com/karpathy/llm-council) — peer review 强制匿名 |
+| consensus/majority/individual schema | [Mozilla.ai/star-chamber](https://github.com/peteski22/star-chamber) — Chatham House Rule + 3 级共识 |
+| accountability ledger | [nyldn/claude-octopus](https://github.com/nyldn/claude-octopus) — agent ledger 可追溯 |
+| rubber-stamp 反向施压 prompt | [zscole/adversarial-spec](https://github.com/zscole/adversarial-spec) — 治附和模型 |
 
 ---
 
