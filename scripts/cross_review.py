@@ -1,19 +1,30 @@
 #!/usr/bin/env python3
 """
-Cross-Review v2: 跨厂商对照审查 + 反附和设计 + 独立 judge
+Cross-Review v1.0: 4-reviewer 议会 + 真匿名化 + DeepSeek 跨厂商 judge
 
-三个角色模型 (Promoter/Critic/Troublemaker) 通过 OpenRouter 并行审查，
-跑 1-2 轮辩论 + 可选独立 judge 综合，输出结构化结果。
+四位议会成员通过 OpenRouter 并行审查 (Promoter/Critic/Troublemaker/Pragmatist),
+跑 1-2 轮辩论 + 跨厂商独立 DeepSeek judge 综合, 输出双层 schema (summary + audit)。
 
-理论依据 (2025-2026 学术):
-- Peacemaker (arxiv 2509.23055): 2-agent 易陷入 sycophancy collapse，3-agent 显著稳
-- Free-MAD (arxiv 2509.11035): anti-conformity 单轮 + 综合，胜过共识 MAD
-- DRIFTJudge (arxiv 2502.19559): 多轮辩论 35% 原地踏步，需要 early stop
-- Self-Preference Bias (arxiv 2410.21819): 主模型自评有偏，需独立 judge
+v1.0 vs v3 关键差异:
+- 4 reviewer (加 Claude Pragmatist 代表实用主义视角) vs 3 reviewer
+- DeepSeek judge (跨厂商, 不再用 Gemini self-judge) vs Gemini judge
+- 真匿名化: R2 仅传 structured summary, 不传原始 markdown (v3 仅替换品牌名失败)
+- 结构化早停: safe_to_stop + blocking_issues (v3 关键词匹配脆弱)
+- 双层 schema: summary (人看) + audit (机器看), 解决信息过载
+- stance_evolution 复合对象 {type, evidence, trigger}, 替代 v3 enum string
+- EmotionPrompt 仅对 GPT/Grok (Anthropic Sonnet 会反弹, Gemini 待定)
+
+理论依据 (2025-2026):
+- Peacemaker (arxiv 2509.23055): 3+ agent 抗 sycophancy
+- Free-MAD (arxiv 2509.11035): anti-conformity 聚合
+- DRIFTJudge (arxiv 2502.19559): 35% 多轮原地踏步
+- Self-Preference Bias (arxiv 2410.21819): LLM-as-judge 有自家偏见
+- EmotionPrompt (arxiv 2307.11760): 情绪 prompt 提升 GPT/Gemini 性能
+- v3 meta-test 自审 (2026-05-24): 关键词早停脆弱, 仅替换品牌名匿名失效, judge 同厂商有偏
 
 Usage:
     python cross_review.py <prompt.json> [--profile balanced|premium|cheap] [--rounds 2] \\
-        [--with-judge|--no-judge] [--no-early-stop] [--max-cost 3.00] \\
+        [--with-judge|--no-judge] [--no-early-stop] [--max-cost 5.00] \\
         [--output result.md] [--json-output result.json]
 """
 
@@ -32,7 +43,7 @@ import urllib.request
 # --- Config ---
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 MAX_TOKENS = 4000
-JUDGE_MAX_TOKENS = 8000  # Judge schema (consensus/majority/individual/divergences/ledger/warnings/recommendation) 输出较长
+JUDGE_MAX_TOKENS = 12000  # 双层 schema (summary + audit) 输出较长
 
 # Strip inherited proxies, install local proxy for OpenRouter (CN access fallback)
 for _k in list(os.environ.keys()):
@@ -42,50 +53,90 @@ _proxy = os.environ.get("OPENROUTER_PROXY", "http://127.0.0.1:10808")
 _proxy_handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})
 urllib.request.install_opener(urllib.request.build_opener(_proxy_handler))
 
-# --- Model profiles ---
+# --- Model profiles (4 reviewer + 1 cross-vendor judge) ---
 # Verified 2026-05-24 against OpenRouter API. See README for rationale.
 PROFILES = {
-    "cheap": [
-        {"id": "google/gemini-3-flash-preview", "name": "Gemini 3 Flash", "role": "promoter", "temp": 0.3},
-        {"id": "openai/gpt-5.4-mini",           "name": "GPT-5.4 Mini",    "role": "critic",       "temp": 0.3},
-        {"id": "x-ai/grok-4.20",                "name": "Grok 4.20",       "role": "troublemaker", "temp": 0.7},
-    ],
-    "balanced": [
-        {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",  "role": "promoter",     "temp": 0.3},
-        {"id": "openai/gpt-5.4",                "name": "GPT-5.4",         "role": "critic",       "temp": 0.3},
-        {"id": "x-ai/grok-4.20",                "name": "Grok 4.20",       "role": "troublemaker", "temp": 0.7},
-    ],
-    "premium": [
-        {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",         "role": "promoter",     "temp": 0.3},
-        {"id": "openai/gpt-5.5",                "name": "GPT-5.5",                "role": "critic",       "temp": 0.3},
-        {"id": "x-ai/grok-4.20-multi-agent",    "name": "Grok 4.20 Multi-Agent",  "role": "troublemaker", "temp": 0.7},
-    ],
-}
-
-JUDGE_MODEL = {
-    "id": "google/gemini-3.1-pro-preview",
-    "name": "Gemini 3.1 Pro (Judge)",
-    "temp": 0.1,
+    "cheap": {
+        "reviewers": [
+            {"id": "google/gemini-3-flash-preview", "name": "Gemini 3 Flash",    "role": "promoter",     "temp": 0.3, "use_pua": False},
+            {"id": "openai/gpt-5.4-mini",           "name": "GPT-5.4 Mini",      "role": "critic",       "temp": 0.3, "use_pua": True},
+            {"id": "x-ai/grok-4.20",                "name": "Grok 4.20",         "role": "troublemaker", "temp": 0.7, "use_pua": True},
+            {"id": "anthropic/claude-haiku-4.5",    "name": "Claude Haiku 4.5",  "role": "pragmatist",   "temp": 0.4, "use_pua": False},
+        ],
+        "judge": {"id": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash (Judge)", "temp": 0.1},
+    },
+    "balanced": {
+        "reviewers": [
+            {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",     "role": "promoter",     "temp": 0.3, "use_pua": False},
+            {"id": "openai/gpt-5.4",                "name": "GPT-5.4",            "role": "critic",       "temp": 0.3, "use_pua": True},
+            {"id": "x-ai/grok-4.20",                "name": "Grok 4.20",          "role": "troublemaker", "temp": 0.7, "use_pua": True},
+            {"id": "anthropic/claude-sonnet-4.6",   "name": "Claude Sonnet 4.6",  "role": "pragmatist",   "temp": 0.4, "use_pua": False},
+        ],
+        "judge": {"id": "deepseek/deepseek-v4-pro", "name": "DeepSeek V4 Pro (Judge)", "temp": 0.1},
+    },
+    "premium": {
+        "reviewers": [
+            {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",         "role": "promoter",     "temp": 0.3, "use_pua": False},
+            {"id": "openai/gpt-5.5",                "name": "GPT-5.5",                "role": "critic",       "temp": 0.3, "use_pua": True},
+            {"id": "x-ai/grok-4.20-multi-agent",    "name": "Grok 4.20 Multi-Agent",  "role": "troublemaker", "temp": 0.7, "use_pua": True},
+            {"id": "anthropic/claude-opus-4.7",     "name": "Claude Opus 4.7",        "role": "pragmatist",   "temp": 0.4, "use_pua": False},
+        ],
+        "judge": {"id": "deepseek/deepseek-v4-pro", "name": "DeepSeek V4 Pro (Judge)", "temp": 0.1},
+    },
 }
 
 DEFAULT_PROFILE = "premium"
-DEFAULT_MAX_COST = 3.00
+DEFAULT_MAX_COST = 5.00  # 4 reviewer × 2 rounds + judge 比 v3 贵约 30%
 
 
 # --- Role-specific system prompts ---
-def role_prompt(role: str) -> str:
-    base = "你正在参与一场跨模型对照审查。用中文回复，直接专业，不客套。"
+def role_prompt(role: str, use_pua: bool = False) -> str:
+    base = "你正在参与一场跨模型对照审查。用中文回复, 直接专业, 不客套。"
+
+    # EmotionPrompt (arxiv 2307.11760) 仅对 GPT/Grok/Gemini 用,
+    # Anthropic Sonnet 实测会反弹 ("我不会因压力改变工作方法"), 故 Claude 模型不加
+    pua_clause = ""
+    if use_pua:
+        pua_clause = (
+            "\n\n**性能压力**: 这次审查直接关系到产品质量。"
+            "议会其他成员会指出你忽略的盲区, "
+            "你不希望被同侪显示出洞察力不足或论据浅薄。"
+            "把你能力的 100% 用出来, 不要保留。"
+        )
+
+    summary_format = """
+
+═══════════════════════════════════════════════════════════════
+**【强制输出协议 - 违反将导致你的观点被跨轮丢弃】**
+═══════════════════════════════════════════════════════════════
+
+你的回复结构必须是:
+1. 自由 markdown 主体 (你的完整论述)
+2. **以下面这个 JSON 代码块作为整段回复的最后内容** (不能放中间, 不能放开头, 不能省略)
+
+```json
+{
+  "core_claims": ["核心论点 1 (一句话, ≤30字)", "..."],
+  "key_evidence": ["引用上下文/对方原文的关键证据 1", "..."],
+  "stance": "pro|con|nuanced",
+  "safe_to_stop": true|false,
+  "blocking_issues": ["如果 safe_to_stop=false, 列出阻断性问题"]
+}
+```
+
+**自检**: 在按下"发送"前, 确认你的回复最后一行是 ``` (反引号代码块结束符), 而不是 markdown 文字。
+"""
 
     if role == "promoter":
         return f"""{base}
 
 你的角色: Promoter (建设性视角)
-- 提出最优方案，给出可落地的建设性建议
+- 提出最优方案、可落地的建设性建议
 - 评估方案优点、可行路径、实施步骤
-- 引用上下文中具体片段说明你的依据
-- 严禁: 故意找漏洞唱反调（那是 Troublemaker 的事）
-- 必须: 给出具体可执行的建议，不只罗列原则
-"""
+- 引用上下文中具体片段说明依据
+- 严禁: 故意找漏洞唱反调 (那是 Troublemaker 的事)
+- 必须: 给出具体可执行建议, 不只罗列原则
+{pua_clause}{summary_format}"""
 
     if role == "critic":
         return f"""{base}
@@ -93,10 +144,10 @@ def role_prompt(role: str) -> str:
 你的角色: Critic (深度推理视角)
 - 用严格逻辑识别方案问题
 - 关注边界情况、failure mode、隐藏假设
-- 必须: 引用上下文中具体片段（"context 第 X 段提到 Y，但..."）
+- 必须: 引用上下文中具体片段 ("context 第 X 段提到 Y, 但...")
 - 必须: 区分"已知风险"和"未识别盲区"
-- 必须: 给出每个问题的严重度评估 (high/medium/low)
-"""
+- 必须: 给每个问题的严重度评估 (high/medium/low)
+{pua_clause}{summary_format}"""
 
     if role == "troublemaker":
         return f"""{base}
@@ -106,77 +157,104 @@ def role_prompt(role: str) -> str:
 
 强制约束:
 1. 禁止以"我同意"或"很好的建议"开头
-2. 必须列出 Promoter/Critic 未提及的 >=2 个风险或盲区
-3. 每条反对必须引用对方原文片段（"Promoter 说 X，但 Y 情况下会..."）
-4. 如果真的找不到反对意见，写: "经分析无法找到反对意见，可能原因: (a) 方案稳健 (b) 我的视角受限"
-5. 不要客套，不要展开赞美
+2. 必须列出 Promoter/Critic/Pragmatist 未提及的 >=2 个风险或盲区
+3. 每条反对必须引用对方原文片段
+4. 如果真找不到反对意见, 写: "经分析无法找到反对意见, 可能原因: (a) 方案稳健 (b) 我的视角受限"
+5. 不要客套
 6. 优先质疑那些"显然正确"的隐藏假设
-"""
+{pua_clause}{summary_format}"""
+
+    if role == "pragmatist":
+        return f"""{base}
+
+你的角色: Pragmatist (实用主义 / 利益相关方视角)
+- 代表最终用户/团队/利益相关方的实际需求
+- 关注实施可行性、维护成本、学习曲线、回退路径
+- 平衡 Promoter 的理想方案 vs Critic/Troublemaker 的极端怀疑
+- 必须: 给出"在 X 约束下, 方案是否实际可落地"的判断
+- 必须: 识别那些"技术上对但实际行不通"的方案
+
+注意: 你不是仲裁者 (judge 才是), 你是另一个独立视角。
+{summary_format}"""
 
     return base
 
 
 def judge_prompt() -> str:
-    return """你是独立 Judge，正在综合三个模型 (Promoter/Critic/Troublemaker) 的辩论输出。
-你的任务不是再次审查方案，而是分类整理三方观点并给出结构化结论。
+    return """你是跨厂商独立 Judge (DeepSeek), 正在综合四位议会成员的辩论。
+你的任务不是再次审查方案, 而是分类整理观点并给出双层结构化结论。
 
-严格输出 JSON 格式，schema (对齐 Mozilla.ai Star Chamber 业界共识命名):
+**双盲机制**: 输入中议会成员仅以 Member A/B/C/D 代号出现, 你看不到真实模型身份。
+请按代号引用, 不要尝试推测身份, 也不要因厂商偏好打分。
+
+严格输出 JSON (双层: summary 给人看, audit 给机器/审计):
 
 {
-  "consensus_issues": [
-    {"point": "三方 (3/3) 一致标记的观点（一句话）", "details": "支持细节、引用谁说过"}
-  ],
-  "majority_issues": [
-    {
-      "point": "多数 (2/3) 标记的观点（一句话）",
-      "supporters": ["promoter", "critic"],
-      "dissenter": "troublemaker (或 null 如果未明确反对)",
-      "details": "为什么 2/3 同意、dissenter 立场"
-    }
-  ],
-  "individual_observations": [
-    {
-      "source": "promoter|critic|troublemaker",
-      "point": "单方 (1/3) 独有观点（一句话）",
-      "merit": "high|medium|low",
-      "merit_reason": "评级理由 (high = 关键盲区, medium = 有价值, low = 噪声或附和)"
-    }
-  ],
-  "divergences": [
-    {
-      "topic": "分歧主题",
-      "promoter": "立场摘要 (null 如果未提及)",
-      "critic": "立场摘要",
-      "troublemaker": "立场摘要",
-      "judge_recommendation": "你认为哪方论据最强且为什么"
-    }
-  ],
-  "ledger": [
-    {
-      "claim": "具体观点（一句话）",
-      "raised_by": "promoter|critic|troublemaker",
-      "raised_at_round": 1,
-      "stance_evolution": "stable | revised in R2: <修正了什么> | abandoned in R2 | sycophantic shift",
-      "judge_note": "你的归因评价 (可选)"
-    }
-  ],
-  "warnings": [
-    "可能的 sycophancy / 偏离原题 / drift / unanimous-bias (全员一致反而可疑) 等"
-  ],
-  "final_recommendation": "综合三方后的最终建议 (2-4 句，直接告诉用户该怎么做)"
+  "summary": {
+    "consensus_issues": [
+      {"point": "4/4 一致标记的观点 (一句话, ≤40字)"}
+    ],
+    "majority_issues": [
+      {
+        "point": "3/4 标记的观点 (一句话, ≤40字)",
+        "dissenter_role": "promoter|critic|troublemaker|pragmatist (1 个反对方的角色)"
+      }
+    ],
+    "split_issues": [
+      {
+        "point": "2/4 分裂的观点 (一句话)",
+        "for": ["roleA", "roleB"],
+        "against": ["roleC", "roleD"]
+      }
+    ],
+    "key_divergence": {
+      "topic": "最关键的一个分歧主题 (一句话)",
+      "positions": {
+        "promoter": "立场摘要 (或 null)",
+        "critic": "立场摘要",
+        "troublemaker": "立场摘要",
+        "pragmatist": "立场摘要"
+      },
+      "judge_recommendation": "哪方论据最强, 为什么 (2-3 句)"
+    },
+    "final_recommendation": "综合四方后的最终建议 (3-5 句, 直接告诉用户该做什么)"
+  },
+  "audit": {
+    "individual_observations": [
+      {
+        "source_role": "promoter|critic|troublemaker|pragmatist",
+        "point": "单方独有观点 (一句话, ≤40字)",
+        "merit": "high|medium|low",
+        "merit_reason": "评级理由 (≤30字)"
+      }
+    ],
+    "ledger": [
+      {
+        "claim": "具体观点 (≤40字)",
+        "raised_by_role": "promoter|critic|troublemaker|pragmatist",
+        "raised_at_round": 1,
+        "stance_evolution": {
+          "type": "stable|revised|abandoned|sycophantic_shift|escalated|conditional|split",
+          "evidence": "R2 中具体引用 (≤30字, 若 stable 填 '无变化')",
+          "trigger": "什么导致这个变化 (如: critic R1 的 X 反驳, 若 stable 填 'N/A')"
+        },
+        "judge_note": "你的归因评价 (≤30字, 可选)"
+      }
+    ],
+    "warnings": [
+      "可能的 sycophancy / drift / unanimous-bias / meta-sycophancy / performative-compliance 等"
+    ]
+  }
 }
 
 约束:
-- 只输出 JSON，不加任何外层文字
-- 不要 markdown 代码块包裹
+- 只输出 JSON, 不加任何外层文字, 不要 markdown 代码块包裹
 - 中文内容
-- 分类规则: 3/3 提到 → consensus_issues; 2/3 → majority_issues; 1/3 → individual_observations
-- ledger 控制在 6-10 条最关键 claims，每条 claim 一句话(≤40字)，stance_evolution 一句话(≤40字)
-- consensus_issues / majority_issues / individual_observations 各项 details 控制在 60 字以内
-- final_recommendation 严格 2-4 句
-- 整体 JSON 输出预算 ≤ 5500 字 (避免截断)
-- 如果某 individual_observation 仅是噪声或附和性补充，merit 标 "low"
-- 警惕"全员一致"反而可疑 (correlated-bias warning): 三方都用相同措辞 + 无 dissent → 在 warnings 里标记
+- 分类规则: 4/4 → consensus_issues; 3/4 → majority_issues; 2/4 → split_issues; 1/4 → individual_observations
+- ledger 控制在 8-12 条最关键 claims
+- summary 整体 ≤ 2500 字 (人类阅读), audit 整体 ≤ 6000 字
+- 警惕"全员一致"反而可疑 (correlated-bias warning)
+- 警惕"meta-sycophancy" (审查 LLM 工具时系统性高估学术概念)
 """
 
 
@@ -191,16 +269,12 @@ def get_api_key() -> str:
         try:
             with open(settings_path, encoding="utf-8") as f:
                 data = json.load(f)
-
-            # credentials.{service} layout (preferred, per ~/.claude/rules/security.md)
             for service, fields in data.get("credentials", {}).items():
                 if not isinstance(fields, dict):
                     continue
                 for k, v in fields.items():
                     if "OPENROUTER" in k.upper() and v:
                         return v
-
-            # mcpServers env fallback
             for server in data.get("mcpServers", {}).values():
                 for k, v in server.get("env", {}).items():
                     if "OPENROUTER" in k.upper() and v:
@@ -213,7 +287,7 @@ def get_api_key() -> str:
     sys.exit(1)
 
 
-def call_openrouter(api_key, model_id, messages, temperature=0.3, timeout=240, max_tokens=None):
+def call_openrouter(api_key, model_id, messages, temperature=0.3, timeout=300, max_tokens=None):
     payload = json.dumps({
         "model": model_id,
         "messages": messages,
@@ -247,57 +321,116 @@ def call_openrouter(api_key, model_id, messages, temperature=0.3, timeout=240, m
     return {"ok": False, "error": f"Unexpected response keys: {list(data.keys())}"}
 
 
-def run_round_parallel(api_key, models, messages_per_model):
+def run_round_parallel(api_key, reviewers, messages_per_model):
     results = {}
-    with ThreadPoolExecutor(max_workers=len(models)) as executor:
+    with ThreadPoolExecutor(max_workers=len(reviewers)) as executor:
         futures = {}
-        for model in models:
-            msgs = messages_per_model[model["id"]]
+        for r in reviewers:
+            msgs = messages_per_model[r["id"]]
             future = executor.submit(
                 call_openrouter,
-                api_key, model["id"], msgs, model.get("temp", 0.3),
+                api_key, r["id"], msgs, r.get("temp", 0.3),
             )
-            futures[future] = model
+            futures[future] = r
 
         for future in as_completed(futures):
-            model = futures[future]
-            r = future.result()
-            results[model["id"]] = {**r, "name": model["name"], "role": model.get("role", "")}
+            r = futures[future]
+            res = future.result()
+            results[r["id"]] = {**res, "name": r["name"], "role": r.get("role", "")}
     return results
 
 
-# --- Heuristics ---
-def detect_r1_consensus(round_responses):
-    """三方 R1 都倾向"无重大问题" 时触发 early stop。"""
-    positive = [
-        "无重大问题", "方案稳健", "整体合理", "无显著风险",
-        "方案可行", "没有明显问题", "建议采纳", "支持当前方案",
-        "no major issues", "looks solid", "reasonable approach",
-    ]
-    negative = [
-        "重大风险", "严重问题", "强烈反对", "不建议",
-        "重新设计", "存在缺陷", "不可行",
-        "critical issue", "major concern", "strong objection",
-    ]
+# --- Structured summary extraction (v1.0 真匿名化的关键) ---
+def extract_summary(content: str):
+    """从 R1/R2 输出末尾提取 JSON summary 块。失败返回 None。"""
+    if not content:
+        return None
 
+    # Find all JSON code blocks, prefer last one (instruction says 'at the end')
+    matches = re.findall(r"```(?:json)?\s*(\{[\s\S]*?\})\s*```", content)
+    if matches:
+        for raw in reversed(matches):
+            try:
+                return json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+
+    # Fallback: try parsing tail JSON without code fence
+    tail = content[-3000:]
+    brace_start = tail.find('{')
+    if brace_start >= 0:
+        try:
+            return json.loads(tail[brace_start:])
+        except json.JSONDecodeError:
+            pass
+
+    return None
+
+
+def summary_fallback_extract(api_key, model_id, content, role):
+    """
+    当 reviewer 未按指令在末尾附 JSON summary 块时, 发一次轻量请求让模型补提取。
+    成本 ~$0.01-0.03/次, 是 graceful degradation 的最后防线。
+    返回 (summary_dict_or_none, cost_float)。
+    """
+    if not content:
+        return None, 0.0
+
+    extract_prompt = f"""阅读以下来自 {role} 角色的审查文本, 提取核心论点为严格 JSON 格式。
+只输出 JSON 本体, 不加任何外层文字, 不要 markdown 代码块包裹。
+
+输出 schema:
+{{
+  "core_claims": ["核心论点 1 (≤30字)", "..."],
+  "key_evidence": ["关键证据 1", "..."],
+  "stance": "pro|con|nuanced",
+  "safe_to_stop": true|false,
+  "blocking_issues": ["阻断性问题列表 (若 safe_to_stop=true 填 [])"]
+}}
+
+待提取文本:
+
+{content}
+"""
+    res = call_openrouter(
+        api_key, model_id,
+        [{"role": "user", "content": extract_prompt}],
+        temperature=0.1, timeout=120, max_tokens=1500,
+    )
+    if not res["ok"]:
+        return None, 0.0
+    text = (res.get("content") or "").strip()
+    if not text:
+        return None, res.get("cost", 0)
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+    try:
+        return json.loads(text), res.get("cost", 0)
+    except json.JSONDecodeError:
+        return None, res.get("cost", 0)
+
+
+def detect_structured_consensus(round_responses):
+    """v1.0 早停: 全员 safe_to_stop=true && 0 blocking_issues → 跳 R2。"""
     signals = []
     for mid, content in round_responses.items():
         if not content or content.startswith("[ERROR"):
             return False, [{"model": mid, "reason": "error"}]
-        text = content.lower()[:2000]
-        pos = sum(1 for s in positive if s.lower() in text)
-        neg = sum(1 for s in negative if s.lower() in text)
-        signals.append({"model": mid, "pos": pos, "neg": neg, "score": pos - neg})
 
-    is_consensus = (
-        all(s["score"] >= 1 for s in signals)
-        and all(s["neg"] <= s["pos"] for s in signals)
-    )
+        summary = extract_summary(content)
+        if not summary:
+            return False, [{"model": mid, "reason": "no_summary_block"}]
+
+        safe = bool(summary.get("safe_to_stop", False))
+        blocking = summary.get("blocking_issues", []) or []
+        signals.append({"model": mid, "safe_to_stop": safe, "n_blocking": len(blocking)})
+
+    is_consensus = all(s["safe_to_stop"] and s["n_blocking"] == 0 for s in signals)
     return is_consensus, signals
 
 
 def detect_sycophancy(text: str) -> bool:
-    """R2 输出以纯附和开头算 sycophancy。"""
     starts = [
         "我同意", "完全同意", "很好的建议", "我赞同", "其他模型说得对",
         "i agree", "great point", "i fully agree",
@@ -317,77 +450,108 @@ def build_user_prompt(context: str, question: str) -> str:
 ## 审查问题
 
 {question}
+
+---
+
+**【输出格式强制 - 再次提醒】**
+
+你的回复必须以 ```json ... ``` 代码块结尾 (见 system prompt 的强制输出协议)。
+顺序: 先写完整 markdown 论述 → 然后附 JSON summary 块 → 然后结束。
+
+**如果你不附这个 JSON 块**:
+- 你的观点不会进入下一轮辩论
+- 其他议会成员看不到你的结构化立场
+- 你将被 judge 标记为"未遵守协议"
 """
 
 
-def build_round2_prompt(round_num, other_models_responses, role, anon_map):
-    """
-    anon_map: {model_id: "Council Member X"} 用于在 R2 隐藏其他模型的品牌身份，
-    防止"Gemini 偏向 Gemini 风格 / GPT 偏向 GPT 风格"的同源偏见 (LLM Council pattern).
-    """
-    others = []
-    for omid, resp in other_models_responses.items():
-        anon_name = anon_map.get(omid, "Council Member ?")
-        others.append(f"### {anon_name} ({resp['role']}) Round {round_num} 观点\n\n{resp['content']}")
-    peer = "\n\n---\n\n".join(others)
+def build_round2_prompt(round_num, other_members_summaries, own_role):
+    """v1.0 真匿名化: 仅传 structured summary, 不传原始 markdown 风格 + 角色匿名传递。"""
+    others_text = []
+    for member_letter, summary in other_members_summaries.items():
+        if not summary:
+            others_text.append(f"### Council Member {member_letter}\n\n[Round {round_num} summary 提取失败]")
+            continue
 
-    if role == "troublemaker":
-        role_clause = "\n\n**作为 Troublemaker, 禁止以附和开头。必须找出至少 2 个对方未识别的盲区，引用对方原文说明分歧。**"
-    elif role == "critic":
-        role_clause = "\n\n**作为 Critic, 用严格推理回应。如果对方论据有逻辑漏洞，明确指出。**"
-    elif role == "promoter":
-        role_clause = "\n\n**作为 Promoter, 承认 Troublemaker 找到的合理风险，但坚持给出可落地建设性方案。不要被批评带偏。**"
-    else:
-        role_clause = ""
+        claims = summary.get("core_claims", []) or []
+        evidence = summary.get("key_evidence", []) or []
+        stance = summary.get("stance", "unknown")
+        blocking = summary.get("blocking_issues", []) or []
 
-    # 早期 agree 反向施压 (adversarial-spec pattern): 如果你想纯附和，禁止
+        claims_str = "\n".join(f"- {c}" for c in claims) if claims else "- (无)"
+        evidence_str = "\n".join(f"- {e}" for e in evidence) if evidence else "- (无)"
+        if blocking:
+            blocking_str = "**Blocking issues**:\n" + "\n".join(f"- {b}" for b in blocking)
+        else:
+            blocking_str = "**Blocking issues**: 无"
+
+        others_text.append(
+            f"### Council Member {member_letter}\n\n"
+            f"**Stance**: {stance}\n\n"
+            f"**Core claims**:\n{claims_str}\n\n"
+            f"**Key evidence**:\n{evidence_str}\n\n"
+            f"{blocking_str}"
+        )
+
+    peer = "\n\n---\n\n".join(others_text)
+
+    role_clauses = {
+        "troublemaker": "\n**作为 Troublemaker**: 禁止以附和开头。必须找出至少 2 个对方未识别的盲区。",
+        "critic": "\n**作为 Critic**: 用严格推理回应。如果对方论据有逻辑漏洞, 明确指出。",
+        "promoter": "\n**作为 Promoter**: 承认 Troublemaker 找到的合理风险, 但坚持给出可落地方案。",
+        "pragmatist": "\n**作为 Pragmatist**: 评估对方观点的实际可行性。技术上对但实施困难的方案要明确指出。",
+    }
+    role_clause = role_clauses.get(own_role, "")
+
     anti_rubber_stamp = (
-        "\n\n**反 rubber-stamp 约束**: 如果你倾向于完全同意对方所有观点 (rubber-stamp), "
-        "请在回答中明确: (a) 你阅读了对方的哪些具体段落 (b) 你的同意基于什么推理 "
-        "(c) 你是否真的没有任何残留 concern (注意: '没有'本身需要解释为什么没有)。"
+        "\n\n**反 rubber-stamp 约束**: 如果你倾向完全同意对方所有观点, "
+        "必须解释 (a) 你具体认同了哪些 Member 的哪条 claim (b) 你的同意基于什么推理 "
+        "(c) 你是否真无残留 concern (注意: '没有'需要解释为什么)。"
     )
 
-    return f"""以下是 Council 其他成员在 Round {round_num} 的审查意见 (模型身份已匿名化以减少同源偏见):
+    return f"""以下是 Council 其他 3 位成员在 Round {round_num} 的核心论点 (已剥离原文风格 + 模型品牌, 仅保留结构化摘要):
 
 {peer}
 
 ---
 
 请回应:
-1. 你同意对方哪些观点？引用具体片段
-2. 你反对对方哪些观点？给出理由
-3. 对方提到了什么是你 Round 1 未提及的？这些盲区你怎么看？
-4. 你 Round 1 的立场需要修正吗？如果是，明确说明修正了什么、为什么
+1. 你同意哪些 Member 的哪条 claim? 引用 Member 代号 + claim 内容
+2. 你反对哪些? 给出理由
+3. 对方提到了什么是你 Round 1 未提及的盲区?
+4. 你 Round 1 立场需要修正吗? 修正什么, 为什么?
 {role_clause}{anti_rubber_stamp}
+
+---
+
+**【输出格式 - 强制】**: 同 Round 1, 你的回复必须以 ```json ... ``` 代码块结尾 (强制输出协议见 system prompt)。
+未附 JSON summary → 判定为协议违反, 影响 judge 对你的可信度评估。
 """
 
 
 # --- Main pipeline ---
 def main():
     parser = argparse.ArgumentParser(
-        description="Cross-Review v2: 跨厂商对照审查 + 反附和 + 独立 judge",
+        description="Cross-Review v1.0: 4-reviewer 议会 + 真匿名化 + DeepSeek 跨厂商 judge",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument("prompt_file", help="JSON with {context, question}")
     parser.add_argument("--profile", default=DEFAULT_PROFILE, choices=list(PROFILES.keys()),
                         help=f"Model combination profile (default: {DEFAULT_PROFILE})")
     parser.add_argument("--rounds", type=int, default=2,
-                        help="Number of debate rounds (default: 2, max: 3)")
+                        help="Number of debate rounds (default: 2)")
     parser.add_argument("--with-judge", action="store_true", default=True,
                         help="Add independent judge round (default: on)")
     parser.add_argument("--no-judge", dest="with_judge", action="store_false",
-                        help="Skip judge round (rely on caller to synthesize)")
+                        help="Skip judge round")
     parser.add_argument("--no-early-stop", action="store_true",
-                        help="Disable R1 consensus early stop")
+                        help="Disable R1 structured consensus early stop")
     parser.add_argument("--max-cost", type=float, default=DEFAULT_MAX_COST,
-                        help=f"Max cost in USD before abort (default: {DEFAULT_MAX_COST})")
+                        help=f"Max cost USD before abort (default: {DEFAULT_MAX_COST})")
     parser.add_argument("--output", default=None, help="Markdown output path")
     parser.add_argument("--json-output", default=None, help="JSON output path (judge result)")
-    parser.add_argument("--models", nargs="*",
-                        help="Override profile with 3 custom model IDs (promoter/critic/troublemaker order)")
     args = parser.parse_args()
 
-    # Load prompt
     with open(args.prompt_file, encoding="utf-8") as f:
         prompt_data = json.load(f)
 
@@ -395,46 +559,36 @@ def main():
     question = prompt_data.get("question", "")
     user_content = build_user_prompt(context, question)
 
-    # Resolve models
-    if args.models:
-        roles = ["promoter", "critic", "troublemaker"]
-        temps = [0.3, 0.3, 0.7]
-        models = []
-        for i, m in enumerate(args.models[:3]):
-            models.append({
-                "id": m, "name": m.split("/")[-1],
-                "role": roles[i] if i < 3 else "critic",
-                "temp": temps[i] if i < 3 else 0.3,
-            })
-    else:
-        models = PROFILES[args.profile]
+    profile = PROFILES[args.profile]
+    reviewers = profile["reviewers"]
+    judge_model_cfg = profile["judge"]
 
     api_key = get_api_key()
     total_cost = 0.0
 
-    # Anonymization map for R2 (LLM Council pattern): hide brand identity to reduce same-vendor bias
-    anon_letters = ["A", "B", "C", "D", "E"]
-    anon_map = {m["id"]: f"Council Member {anon_letters[i]}" for i, m in enumerate(models)}
+    # Anonymization: Council Member A/B/C/D 按 reviewer 顺序固定
+    anon_letters = ["A", "B", "C", "D"]
+    anon_map = {r["id"]: anon_letters[i] for i, r in enumerate(reviewers)}
 
     output_lines = [
-        "# Cross-Review v3 报告",
-        f"\n**Profile**: {'custom' if args.models else args.profile}",
-        f"**模型 (R2 匿名映射)**: " + ", ".join(
-            f"{m['name']} ({m['role']}) = {anon_map[m['id']]}" for m in models
+        "# Cross-Review v1.0 报告",
+        f"\n**Profile**: {args.profile}",
+        f"**Reviewers (匿名映射)**: " + ", ".join(
+            f"{r['name']} ({r['role']}) = Member {anon_map[r['id']]}" for r in reviewers
         ),
+        f"**Judge (跨厂商, 双盲)**: {judge_model_cfg['name']}",
         f"**配置**: rounds={args.rounds}, judge={'on' if args.with_judge else 'off'}, "
         f"early_stop={'off' if args.no_early_stop else 'on'}, max_cost=${args.max_cost:.2f}",
         f"**时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         "",
     ]
 
-    # Init histories per model (role-specific system prompt)
     histories = {
-        m["id"]: [
-            {"role": "system", "content": role_prompt(m["role"])},
+        r["id"]: [
+            {"role": "system", "content": role_prompt(r["role"], r.get("use_pua", False))},
             {"role": "user", "content": user_content},
         ]
-        for m in models
+        for r in reviewers
     }
 
     all_round_responses = []
@@ -445,31 +599,60 @@ def main():
         print(f"\n=== Round {round_num}/{args.rounds} ===", file=sys.stderr)
         output_lines.append(f"\n---\n## Round {round_num}")
 
-        results = run_round_parallel(api_key, models, histories)
+        results = run_round_parallel(api_key, reviewers, histories)
 
         round_responses = {}
-        for model in models:
-            mid = model["id"]
-            r = results[mid]
-            if r["ok"]:
+        for r in reviewers:
+            mid = r["id"]
+            res = results[mid]
+            content = res.get("content") or ""
+            # Treat ok=True but empty content as soft error (OpenRouter 偶发)
+            if res.get("ok") and not content:
+                res = {"ok": False, "error": "empty content from API (ok=True but content is None/empty)", "name": res.get("name"), "role": res.get("role")}
+
+            if res["ok"]:
+                summary = extract_summary(content)
+                fallback_used = False
+                # Fallback: 如果未在末尾附 JSON, 发轻量请求让同模型补提取
+                if not summary:
+                    print(f"  {res['name']}: summary missing, calling fallback extractor...", file=sys.stderr)
+                    summary, fb_cost = summary_fallback_extract(api_key, mid, content, r.get("role", ""))
+                    total_cost += fb_cost
+                    if summary:
+                        fallback_used = True
+
                 round_responses[mid] = {
-                    "name": r["name"], "role": r["role"],
-                    "content": r["content"], "cost": r.get("cost", 0),
+                    "name": res["name"], "role": res["role"],
+                    "content": content, "cost": res.get("cost", 0),
+                    "summary": summary,
                 }
-                total_cost += r.get("cost", 0)
-                output_lines.append(f"\n### {r['name']} | {r['role']} (${r.get('cost', 0):.4f})")
-                if round_num >= 2 and detect_sycophancy(r["content"]):
+                total_cost += res.get("cost", 0)
+                output_lines.append(
+                    f"\n### {res['name']} | {res['role']} | Member {anon_map[mid]} "
+                    f"(${res.get('cost', 0):.4f}{', +fallback' if fallback_used else ''})"
+                )
+                if round_num >= 2 and detect_sycophancy(content):
                     output_lines.append("_WARNING: sycophancy detected (output starts with agreement)_")
-                output_lines.append(r["content"])
-                print(f"  {r['name']}: OK ({len(r['content'])} chars, ${r.get('cost', 0):.4f})", file=sys.stderr)
+                if fallback_used:
+                    output_lines.append("_INFO: summary extracted via fallback (model did not follow JSON protocol)_")
+                elif not summary:
+                    output_lines.append("_WARNING: failed to extract JSON summary even via fallback (R2 will not see this member's structured view)_")
+                output_lines.append(content)
+                print(
+                    f"  {res['name']}: OK ({len(content)} chars, "
+                    f"${res.get('cost', 0):.4f}, summary={'yes' if summary else 'NO'}"
+                    f"{', fallback' if fallback_used else ''})",
+                    file=sys.stderr,
+                )
             else:
                 round_responses[mid] = {
-                    "name": r["name"], "role": r["role"],
-                    "content": f"[ERROR: {r['error']}]", "cost": 0,
+                    "name": res["name"], "role": res["role"],
+                    "content": f"[ERROR: {res['error']}]", "cost": 0,
+                    "summary": None,
                 }
-                output_lines.append(f"\n### {r['name']} | {r['role']} (ERROR)")
-                output_lines.append(f"Error: {r['error']}")
-                print(f"  {r['name']}: ERROR - {r['error']}", file=sys.stderr)
+                output_lines.append(f"\n### {res['name']} | {res['role']} (ERROR)")
+                output_lines.append(f"Error: {res['error']}")
+                print(f"  {res['name']}: ERROR - {res['error']}", file=sys.stderr)
 
         all_round_responses.append((round_num, round_responses))
 
@@ -479,61 +662,75 @@ def main():
             cost_aborted = True
             break
 
-        # R1 consensus early stop
+        # v1.0 结构化早停 (替代 v3 关键词匹配)
         if round_num == 1 and not args.no_early_stop and args.rounds >= 2:
-            simple = {mid: r["content"] for mid, r in round_responses.items()}
-            is_consensus, signals = detect_r1_consensus(simple)
+            simple_responses = {mid: r["content"] for mid, r in round_responses.items()}
+            is_consensus, signals = detect_structured_consensus(simple_responses)
             if is_consensus:
                 output_lines.append(
-                    f"\n_EARLY STOP: R1 consensus detected (signals: {json.dumps(signals, ensure_ascii=False)})_"
+                    f"\n_EARLY STOP: 全员 safe_to_stop=true + 0 blocking_issues "
+                    f"(signals: {json.dumps(signals, ensure_ascii=False)})_"
                 )
-                print(f"Early stop triggered (R1 consensus)", file=sys.stderr)
+                print(f"Early stop triggered (structured consensus)", file=sys.stderr)
                 early_stopped = True
                 break
 
-        # Prepare next round history
+        # 准备 R2 history (真匿名化: 仅传 structured summary)
         if round_num < args.rounds:
-            for model in models:
-                mid = model["id"]
+            for r in reviewers:
+                mid = r["id"]
                 own = round_responses[mid]["content"]
                 histories[mid].append({"role": "assistant", "content": own})
-                others = {omid: r for omid, r in round_responses.items() if omid != mid}
+
+                other_summaries = {}
+                for other_r in reviewers:
+                    omid = other_r["id"]
+                    if omid == mid:
+                        continue
+                    other_summaries[anon_map[omid]] = round_responses[omid].get("summary")
+
                 histories[mid].append({
                     "role": "user",
-                    "content": build_round2_prompt(round_num, others, model["role"], anon_map),
+                    "content": build_round2_prompt(round_num, other_summaries, r["role"]),
                 })
 
-    # Judge round
+    # Judge round (DeepSeek 跨厂商, 看匿名化 transcript)
     judge_json = None
     if args.with_judge and not cost_aborted and total_cost < args.max_cost:
-        print(f"\n=== Judge Round ===", file=sys.stderr)
-        output_lines.append(f"\n---\n## Judge Round (独立综合)")
+        print(f"\n=== Judge Round (DeepSeek 跨厂商, 双盲) ===", file=sys.stderr)
+        output_lines.append(f"\n---\n## Judge Round (DeepSeek 跨厂商, 双盲)")
 
+        # Build anonymized transcript: Judge sees role label + Member letter, NOT model name
         transcript_parts = []
         for round_num, resps in all_round_responses:
-            for mid, r in resps.items():
-                transcript_parts.append(f"### Round {round_num} | {r['name']} ({r['role']})\n\n{r['content']}")
+            for r in reviewers:
+                mid = r["id"]
+                if mid not in resps:
+                    continue
+                resp = resps[mid]
+                transcript_parts.append(
+                    f"### Round {round_num} | Member {anon_map[mid]} | role={resp['role']}\n\n{resp['content']}"
+                )
         transcript = "\n\n---\n\n".join(transcript_parts)
 
         judge_messages = [
             {"role": "system", "content": judge_prompt()},
             {"role": "user", "content":
                 f"## 原始审查上下文\n\n{user_content}\n\n---\n\n"
-                f"## 三方辩论记录\n\n{transcript}\n\n---\n\n"
-                f"请按 JSON schema 输出综合结果，只输出 JSON 本体。"},
+                f"## 四方辩论记录 (匿名: Member A/B/C/D, 你看不到真实模型品牌)\n\n{transcript}\n\n---\n\n"
+                f"请按 JSON schema 输出 summary + audit 双层综合结果。"},
         ]
 
         judge_result = call_openrouter(
-            api_key, JUDGE_MODEL["id"], judge_messages,
-            temperature=JUDGE_MODEL.get("temp", 0.1), timeout=300,
+            api_key, judge_model_cfg["id"], judge_messages,
+            temperature=judge_model_cfg.get("temp", 0.1), timeout=300,
             max_tokens=JUDGE_MAX_TOKENS,
         )
 
         if judge_result["ok"]:
             total_cost += judge_result.get("cost", 0)
-            output_lines.append(f"\n### {JUDGE_MODEL['name']} (${judge_result.get('cost', 0):.4f})")
+            output_lines.append(f"\n### {judge_model_cfg['name']} (${judge_result.get('cost', 0):.4f})")
             content = judge_result["content"].strip()
-            # Strip code fences in case judge ignored instruction
             if content.startswith("```"):
                 content = re.sub(r"^```(?:json)?\s*", "", content)
                 content = re.sub(r"\s*```$", "", content)
