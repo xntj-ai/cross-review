@@ -1,18 +1,21 @@
 #!/usr/bin/env python3
 """
-Cross-Review v1.0: 4-reviewer 议会 + 真匿名化 + DeepSeek 跨厂商 judge
+Cross-Review v1.1: R0 Perplexity 调研 + 4-reviewer 议会 + Claude Code Pragmatist + Opus 4.7 Judge
 
-四位议会成员通过 OpenRouter 并行审查 (Promoter/Critic/Troublemaker/Pragmatist),
-跑 1-2 轮辩论 + 跨厂商独立 DeepSeek judge 综合, 输出双层 schema (summary + audit)。
+流程: R0 Perplexity 联网调研 → R1/R2 议会辩论 (Promoter/Critic/Troublemaker/Pragmatist) →
+独立 Opus 4.7 judge 双盲综合, 输出双层 schema (summary + audit)。
 
-v1.0 vs v3 关键差异:
-- 4 reviewer (加 Claude Pragmatist 代表实用主义视角) vs 3 reviewer
-- DeepSeek judge (跨厂商, 不再用 Gemini self-judge) vs Gemini judge
-- 真匿名化: R2 仅传 structured summary, 不传原始 markdown (v3 仅替换品牌名失败)
-- 结构化早停: safe_to_stop + blocking_issues (v3 关键词匹配脆弱)
-- 双层 schema: summary (人看) + audit (机器看), 解决信息过载
-- stance_evolution 复合对象 {type, evidence, trigger}, 替代 v3 enum string
-- EmotionPrompt 仅对 GPT/Grok (Anthropic Sonnet 会反弹, Gemini 待定)
+v1.1 vs v1.0 关键差异:
+- R0 新增: Perplexity Sonar Pro 联网调研, 把最新行业实况作为 augmented context 喂议会
+- Pragmatist 改为外部 view 优先: prompt.json 可选 pragmatist_view 字段,
+  由 Claude Code 主调用方带 memory + 项目 context 直接写, 跳过 API 调用。
+  未提供时 fallback 到 Claude Sonnet 4.6。
+- Judge 换 Claude Opus 4.7 (premium, 最强综合): v1.0 是 DeepSeek 跨厂商, v1.1 用最强模型 + 议会移除 Claude 避免 self-bias
+
+v1.0 → v1.1 核心改进点:
+- 解决 "模型靠 training data 判断 + 信息过时" 问题 → R0 联网调研
+- 解决 "fresh model 假装懂用户实际处境" 问题 → Pragmatist 改为主调用方提供
+- 解决 "DeepSeek 当 Pragmatist 不擅长该角色" 问题 → 议会移除 DeepSeek, 改 Anthropic Sonnet (fallback)
 
 理论依据 (2025-2026):
 - Peacemaker (arxiv 2509.23055): 3+ agent 抗 sycophancy
@@ -44,6 +47,7 @@ import urllib.request
 OPENROUTER_ENDPOINT = "https://openrouter.ai/api/v1/chat/completions"
 MAX_TOKENS = 4000
 JUDGE_MAX_TOKENS = 12000  # 双层 schema (summary + audit) 输出较长
+RESEARCH_MAX_TOKENS = 3500  # R0 Perplexity 调研输出
 
 # Strip inherited proxies, install local proxy for OpenRouter (CN access fallback)
 for _k in list(os.environ.keys()):
@@ -53,40 +57,43 @@ _proxy = os.environ.get("OPENROUTER_PROXY", "http://127.0.0.1:10808")
 _proxy_handler = urllib.request.ProxyHandler({'http': _proxy, 'https': _proxy})
 urllib.request.install_opener(urllib.request.build_opener(_proxy_handler))
 
-# --- Model profiles (4 reviewer + 1 cross-vendor judge) ---
-# Verified 2026-05-24 against OpenRouter API. See README for rationale.
+# --- Model profiles (v1.1: R0 调研 + 3 reviewer + Pragmatist (外部 or fallback) + Opus Judge) ---
+# Verified 2026-05-24 against OpenRouter API.
 PROFILES = {
     "cheap": {
+        "research": {"id": "perplexity/sonar",     "name": "Perplexity Sonar (Research)",     "temp": 0.2},
         "reviewers": [
             {"id": "google/gemini-3-flash-preview", "name": "Gemini 3 Flash",    "role": "promoter",     "temp": 0.3, "use_pua": False},
             {"id": "openai/gpt-5.4-mini",           "name": "GPT-5.4 Mini",      "role": "critic",       "temp": 0.3, "use_pua": True},
             {"id": "x-ai/grok-4.20",                "name": "Grok 4.20",         "role": "troublemaker", "temp": 0.7, "use_pua": True},
-            {"id": "anthropic/claude-haiku-4.5",    "name": "Claude Haiku 4.5",  "role": "pragmatist",   "temp": 0.4, "use_pua": False},
         ],
-        "judge": {"id": "deepseek/deepseek-v4-flash", "name": "DeepSeek V4 Flash (Judge)", "temp": 0.1},
+        "pragmatist_fallback": {"id": "anthropic/claude-haiku-4.5", "name": "Claude Haiku 4.5 (Pragmatist fallback)", "role": "pragmatist", "temp": 0.4, "use_pua": False},
+        "judge": {"id": "anthropic/claude-haiku-4.5", "name": "Claude Haiku 4.5 (Judge)", "temp": 0.1},
     },
     "balanced": {
+        "research": {"id": "perplexity/sonar-pro", "name": "Perplexity Sonar Pro (Research)", "temp": 0.2},
         "reviewers": [
             {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",     "role": "promoter",     "temp": 0.3, "use_pua": False},
             {"id": "openai/gpt-5.4",                "name": "GPT-5.4",            "role": "critic",       "temp": 0.3, "use_pua": True},
             {"id": "x-ai/grok-4.20",                "name": "Grok 4.20",          "role": "troublemaker", "temp": 0.7, "use_pua": True},
-            {"id": "anthropic/claude-sonnet-4.6",   "name": "Claude Sonnet 4.6",  "role": "pragmatist",   "temp": 0.4, "use_pua": False},
         ],
-        "judge": {"id": "deepseek/deepseek-v4-pro", "name": "DeepSeek V4 Pro (Judge)", "temp": 0.1},
+        "pragmatist_fallback": {"id": "anthropic/claude-sonnet-4.6", "name": "Claude Sonnet 4.6 (Pragmatist fallback)", "role": "pragmatist", "temp": 0.4, "use_pua": False},
+        "judge": {"id": "anthropic/claude-sonnet-4.6", "name": "Claude Sonnet 4.6 (Judge)", "temp": 0.1},
     },
     "premium": {
+        "research": {"id": "perplexity/sonar-pro", "name": "Perplexity Sonar Pro (Research)", "temp": 0.2},
         "reviewers": [
             {"id": "google/gemini-3.1-pro-preview", "name": "Gemini 3.1 Pro",         "role": "promoter",     "temp": 0.3, "use_pua": False},
             {"id": "openai/gpt-5.5",                "name": "GPT-5.5",                "role": "critic",       "temp": 0.3, "use_pua": True},
             {"id": "x-ai/grok-4.20-multi-agent",    "name": "Grok 4.20 Multi-Agent",  "role": "troublemaker", "temp": 0.7, "use_pua": True},
-            {"id": "anthropic/claude-opus-4.7",     "name": "Claude Opus 4.7",        "role": "pragmatist",   "temp": 0.4, "use_pua": False},
         ],
-        "judge": {"id": "deepseek/deepseek-v4-pro", "name": "DeepSeek V4 Pro (Judge)", "temp": 0.1},
+        "pragmatist_fallback": {"id": "anthropic/claude-sonnet-4.6", "name": "Claude Sonnet 4.6 (Pragmatist fallback)", "role": "pragmatist", "temp": 0.4, "use_pua": False},
+        "judge": {"id": "anthropic/claude-opus-4.7", "name": "Claude Opus 4.7 (Judge)", "temp": 0.1},
     },
 }
 
 DEFAULT_PROFILE = "premium"
-DEFAULT_MAX_COST = 5.00  # 4 reviewer × 2 rounds + judge 比 v3 贵约 30%
+DEFAULT_MAX_COST = 5.00  # R0 + 4 reviewer × 2 rounds + judge
 
 
 # --- Role-specific system prompts ---
@@ -367,6 +374,51 @@ def extract_summary(content: str):
     return None
 
 
+def run_research(api_key, research_model_cfg, context, question):
+    """
+    R0: Perplexity 联网调研, 输出 augmented context 给议会。
+    使用 Perplexity Sonar (Pro) 自带 web search + citation。
+    返回 (research_text_or_none, cost)。
+    """
+    research_prompt = f"""请联网调研以下问题相关的最新行业实况、最佳实践、技术方案、踩坑经验。
+
+## 问题
+{question}
+
+## 现有上下文
+{context}
+
+---
+
+要求:
+1. 至少 3 条最新行业实况 (含 citation 链接)
+2. 相关案例 / GitHub repo / 文档链接 (含 URL)
+3. 该问题相关的已知 failure mode / 警告 (含来源)
+
+输出格式 (中文, 控制在 2500 字以内):
+
+# 联网调研补充
+
+## 最新行业实况
+- ...
+
+## 相关案例
+- ...
+
+## 已知警告 / failure mode
+- ...
+"""
+    res = call_openrouter(
+        api_key, research_model_cfg["id"],
+        [{"role": "user", "content": research_prompt}],
+        temperature=research_model_cfg.get("temp", 0.2),
+        timeout=300, max_tokens=RESEARCH_MAX_TOKENS,
+    )
+    if not res["ok"]:
+        return None, 0.0
+    return res.get("content") or "", res.get("cost", 0)
+
+
 def summary_fallback_extract(api_key, model_id, content, role):
     """
     当 reviewer 未按指令在末尾附 JSON summary 块时, 发一次轻量请求让模型补提取。
@@ -440,12 +492,22 @@ def detect_sycophancy(text: str) -> bool:
 
 
 # --- Prompts builders ---
-def build_user_prompt(context: str, question: str) -> str:
+def build_user_prompt(context: str, question: str, research: str = "") -> str:
+    research_block = ""
+    if research:
+        research_block = f"""---
+
+## R0 联网调研补充 (Perplexity 实时 web search)
+
+{research}
+
+"""
+
     return f"""## 审查上下文
 
 {context}
 
----
+{research_block}---
 
 ## 审查问题
 
@@ -546,6 +608,8 @@ def main():
                         help="Skip judge round")
     parser.add_argument("--no-early-stop", action="store_true",
                         help="Disable R1 structured consensus early stop")
+    parser.add_argument("--no-research", action="store_true",
+                        help="Skip R0 Perplexity research round")
     parser.add_argument("--max-cost", type=float, default=DEFAULT_MAX_COST,
                         help=f"Max cost USD before abort (default: {DEFAULT_MAX_COST})")
     parser.add_argument("--output", default=None, help="Markdown output path")
@@ -557,11 +621,25 @@ def main():
 
     context = prompt_data.get("context", "")
     question = prompt_data.get("question", "")
-    user_content = build_user_prompt(context, question)
+    # user_content 在 R0 调研之后构造 (要 augmented with research output)
 
     profile = PROFILES[args.profile]
-    reviewers = profile["reviewers"]
+    research_model_cfg = profile.get("research")
     judge_model_cfg = profile["judge"]
+
+    # v1.1: Pragmatist 优先用主调用方 (Claude Code with memory) 提供的 view, fallback 到 Sonnet 4.6
+    pragmatist_view = prompt_data.get("pragmatist_view", "").strip()
+    pragmatist_cfg = dict(profile["pragmatist_fallback"])
+    if pragmatist_view:
+        pragmatist_cfg = {
+            **pragmatist_cfg,
+            "id": "external/claude-code-orchestrator",
+            "name": "Claude Code (with memory)",
+            "external_r1_content": pragmatist_view,
+        }
+
+    # 议会 = 3 reviewer (Promoter/Critic/Troublemaker) + Pragmatist (外部 view 或 fallback)
+    reviewers = list(profile["reviewers"]) + [pragmatist_cfg]
 
     api_key = get_api_key()
     total_cost = 0.0
@@ -571,17 +649,37 @@ def main():
     anon_map = {r["id"]: anon_letters[i] for i, r in enumerate(reviewers)}
 
     output_lines = [
-        "# Cross-Review v1.0 报告",
+        "# Cross-Review v1.1 报告",
         f"\n**Profile**: {args.profile}",
         f"**Reviewers (匿名映射)**: " + ", ".join(
             f"{r['name']} ({r['role']}) = Member {anon_map[r['id']]}" for r in reviewers
         ),
-        f"**Judge (跨厂商, 双盲)**: {judge_model_cfg['name']}",
+        f"**Pragmatist 来源**: " + ("外部 view (主调用方 Claude Code with memory)" if pragmatist_view else "fallback API"),
+        f"**Research**: {research_model_cfg['name'] if research_model_cfg else '(skipped)'}",
+        f"**Judge**: {judge_model_cfg['name']}",
         f"**配置**: rounds={args.rounds}, judge={'on' if args.with_judge else 'off'}, "
         f"early_stop={'off' if args.no_early_stop else 'on'}, max_cost=${args.max_cost:.2f}",
         f"**时间**: {time.strftime('%Y-%m-%d %H:%M:%S')}",
         "",
     ]
+
+    # === R0: Perplexity 联网调研 ===
+    research_text = ""
+    if research_model_cfg and not args.no_research:
+        print(f"\n=== R0: 联网调研 ({research_model_cfg['name']}) ===", file=sys.stderr)
+        output_lines.append("\n---\n## R0: 联网调研")
+        research_text, research_cost = run_research(api_key, research_model_cfg, context, question)
+        total_cost += research_cost
+        if research_text:
+            output_lines.append(f"\n### {research_model_cfg['name']} (${research_cost:.4f})\n")
+            output_lines.append(research_text)
+            print(f"  {research_model_cfg['name']}: OK ({len(research_text)} chars, ${research_cost:.4f})", file=sys.stderr)
+        else:
+            output_lines.append(f"\n_R0 research failed, continuing without augmented context_")
+            print(f"  {research_model_cfg['name']}: FAILED, continuing without research", file=sys.stderr)
+
+    # 在 R0 之后构造 user_content (含 research)
+    user_content = build_user_prompt(context, question, research_text)
 
     histories = {
         r["id"]: [
@@ -599,7 +697,29 @@ def main():
         print(f"\n=== Round {round_num}/{args.rounds} ===", file=sys.stderr)
         output_lines.append(f"\n---\n## Round {round_num}")
 
-        results = run_round_parallel(api_key, reviewers, histories)
+        # External Pragmatist (Claude Code with memory) 不调 API:
+        # - R1: 直接用主调用方提供的 view 作为输出
+        # - R2+: 立场作为 anchor 保持不变 (Pragmatist 来自主调用方, 不参与轮次演化)
+        preset_results = {}
+        runtime_reviewers = []
+        for r in reviewers:
+            if r.get("external_r1_content"):
+                # External pragmatist, R1/R2 都不调 API
+                content = r["external_r1_content"]
+                if round_num > 1:
+                    content = content + "\n\n_[Pragmatist 立场在本轮保持不变 — 由主调用方提供, 不参与轮次演化]_"
+                preset_results[r["id"]] = {
+                    "ok": True,
+                    "content": content,
+                    "cost": 0.0,
+                    "name": r["name"],
+                    "role": r.get("role", ""),
+                }
+            else:
+                runtime_reviewers.append(r)
+
+        results = run_round_parallel(api_key, runtime_reviewers, histories) if runtime_reviewers else {}
+        results.update(preset_results)
 
         round_responses = {}
         for r in reviewers:
@@ -678,6 +798,9 @@ def main():
         # 准备 R2 history (真匿名化: 仅传 structured summary)
         if round_num < args.rounds:
             for r in reviewers:
+                # External Pragmatist 不参与 R2+ history 构造 (R2 复用 R1 content 不调 API)
+                if r.get("external_r1_content"):
+                    continue
                 mid = r["id"]
                 own = round_responses[mid]["content"]
                 histories[mid].append({"role": "assistant", "content": own})
@@ -697,8 +820,8 @@ def main():
     # Judge round (DeepSeek 跨厂商, 看匿名化 transcript)
     judge_json = None
     if args.with_judge and not cost_aborted and total_cost < args.max_cost:
-        print(f"\n=== Judge Round (DeepSeek 跨厂商, 双盲) ===", file=sys.stderr)
-        output_lines.append(f"\n---\n## Judge Round (DeepSeek 跨厂商, 双盲)")
+        print(f"\n=== Judge Round ({judge_model_cfg['name']}, 双盲) ===", file=sys.stderr)
+        output_lines.append(f"\n---\n## Judge Round ({judge_model_cfg['name']}, 双盲)")
 
         # Build anonymized transcript: Judge sees role label + Member letter, NOT model name
         transcript_parts = []
